@@ -1,0 +1,387 @@
+#!/bin/bash
+
+VERSION="1.0.3"
+
+INTERFACE="${INTERFACE:-}"
+BASE_PORT="${BASE_PORT:-50000}"
+REMOTE_PORT="${REMOTE_PORT:-443}"
+SSH_USER="${SSH_USER:-root}"
+SSH_HOST="${SSH_HOST:-localhost}"
+
+DB_FILE="${DB_FILE:-/usr/local/share/scscan/askey_oui.db}"
+PID_FILE="/tmp/scscan.pid"
+PORT_FILE="/tmp/scscan.ports"
+
+show_help() {
+cat <<EOF
+scscan v$VERSION
+Askey Small Cell Discovery Tool
+
+Usage:
+    $(basename "$0") [OPTIONS]
+
+Options:
+    -h, --help          Show help
+    -v, --version       Show version
+    -u, --update-db     Update Askey OUI database
+    -s, --stop          Stop previous scscan tunnels
+
+Environment:
+    INTERFACE           Network interface
+    BASE_PORT           Local tunnel start port, default: 50000
+    REMOTE_PORT         Remote HTTPS port, default: 443
+    SSH_USER            SSH username, default: root
+    SSH_HOST            SSH target, default: localhost
+
+Examples:
+    $(basename "$0")
+    $(basename "$0") -u
+    $(basename "$0") -s
+    INTERFACE=bridge0 $(basename "$0")
+EOF
+}
+
+select_interface() {
+    if [ -n "$INTERFACE" ]; then
+        return
+    fi
+
+    mapfile -t IFACES < <(
+        ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$'
+    )
+
+    if [ ${#IFACES[@]} -eq 0 ]; then
+        echo "No network interface found."
+        exit 1
+    fi
+
+    echo
+    echo "Available Interfaces"
+    echo
+
+    for i in "${!IFACES[@]}"; do
+        iface="${IFACES[$i]}"
+        ipv4=$(ip -4 -o addr show dev "$iface" | awk '{print $4}' | paste -sd "," -)
+        [ -z "$ipv4" ] && ipv4="No IPv4"
+        echo "$((i+1))) $iface    $ipv4"
+    done
+
+    echo
+
+    if [ ${#IFACES[@]} -eq 1 ]; then
+        INTERFACE="${IFACES[0]}"
+        echo "Using Interface : $INTERFACE"
+        return
+    fi
+
+    while true; do
+        read -p "Select Interface: " n
+
+        if [[ "$n" =~ ^[0-9]+$ ]] &&
+           [ "$n" -ge 1 ] &&
+           [ "$n" -le "${#IFACES[@]}" ]; then
+            INTERFACE="${IFACES[$((n-1))]}"
+            break
+        fi
+
+        echo "Invalid selection."
+    done
+
+    echo
+    echo "Using Interface : $INTERFACE"
+}
+
+create_default_db() {
+    mkdir -p "$(dirname "$DB_FILE")" 2>/dev/null
+
+cat > "$DB_FILE" <<EOF
+00:11:F5
+00:16:E3
+00:1B:9E
+00:21:63
+00:24:D2
+00:26:B6
+00:90:96
+08:33:ED
+08:6A:0A
+08:B0:55
+1C:24:CD
+1C:B0:44
+24:EC:99
+2C:EA:DC
+38:88:71
+4C:AB:F8
+4C:ED:DE
+50:5F:B5
+74:93:DA
+78:29:ED
+7C:B7:33
+7C:DB:98
+80:78:71
+88:33:74
+88:DE:7C
+88:FE:B6
+90:D3:CF
+94:0F:3B
+94:32:51
+94:91:7F
+94:C2:EF
+A0:64:8F
+A0:8A:06
+A4:97:33
+B0:EA:BC
+B4:74:9F
+B4:82:FE
+B4:EE:B4
+C0:D9:62
+C8:B4:22
+EOF
+
+    chmod 644 "$DB_FILE" 2>/dev/null
+}
+
+update_db() {
+    echo "Updating Askey OUI DB..."
+
+    if [ "$(id -u)" -ne 0 ] && [[ "$DB_FILE" == /usr/local/share/* ]]; then
+        cat <<EOF
+
+Error: administrator privilege required.
+
+Database:
+    $DB_FILE
+
+Please run:
+
+    sudo /usr/local/bin/scscan -u
+
+EOF
+        exit 1
+    fi
+
+    mkdir -p "$(dirname "$DB_FILE")" 2>/dev/null
+
+    curl -L -s https://maclookup.app/vendors/askey-computer-corp \
+    | grep -Eo '([A-Fa-f0-9]{2}:){2}[A-Fa-f0-9]{2}' \
+    | tr '[:lower:]' '[:upper:]' \
+    | sort -u > "$DB_FILE"
+
+    if [ ! -s "$DB_FILE" ]; then
+        echo "Update failed. Creating default DB."
+        create_default_db
+    fi
+
+    chmod 644 "$DB_FILE" 2>/dev/null
+
+    echo "DB updated: $DB_FILE"
+    echo "Total OUI: $(wc -l < "$DB_FILE")"
+    exit 0
+}
+
+cleanup_old() {
+    if [ -f "$PID_FILE" ]; then
+        echo "Cleaning previous scscan tunnels..."
+
+        while read -r pid; do
+            [ -n "$pid" ] && kill "$pid" 2>/dev/null
+        done < "$PID_FILE"
+
+        rm -f "$PID_FILE" "$PORT_FILE"
+    fi
+}
+
+cleanup() {
+    echo
+    echo "Closing tunnels..."
+
+    if [ -f "$PID_FILE" ]; then
+        while read -r pid; do
+            [ -n "$pid" ] && kill "$pid" 2>/dev/null
+        done < "$PID_FILE"
+    fi
+
+    rm -f "$PID_FILE" "$PORT_FILE"
+    echo "Done."
+    exit 0
+}
+
+is_askey() {
+    local oui
+    oui=$(echo "$1" | tr '[:lower:]' '[:upper:]' | cut -c1-8)
+    grep -qx "$oui" "$DB_FILE"
+}
+
+port_used() {
+    ss -ltn | awk '{print $4}' | grep -q ":$1$"
+}
+
+next_port() {
+    local port="$1"
+
+    while port_used "$port"; do
+        port=$((port + 1))
+    done
+
+    echo "$port"
+}
+
+show_header() {
+    clear
+    echo "=============================================================="
+    echo "              scscan v$VERSION"
+    echo "        Askey Small Cell Discovery Tool"
+    echo "=============================================================="
+    echo
+    echo "Interface : $INTERFACE"
+    echo "Base Port : $BASE_PORT"
+    echo "Remote    : HTTPS $REMOTE_PORT"
+    echo "OUI DB    : $DB_FILE ($(wc -l < "$DB_FILE") entries)"
+    echo
+}
+
+case "$1" in
+    -h|--help)
+        show_help
+        exit 0
+        ;;
+    -v|--version)
+        echo "scscan v$VERSION"
+        exit 0
+        ;;
+    -u|--update-db)
+        update_db
+        ;;
+    -s|--stop|stop)
+        cleanup_old
+        echo "Stopped previous scscan tunnels."
+        exit 0
+        ;;
+    "")
+        ;;
+    *)
+        echo "Unknown option: $1"
+        echo
+        show_help
+        exit 1
+        ;;
+esac
+
+if [ ! -f "$DB_FILE" ]; then
+    if [ "$(id -u)" -ne 0 ] && [[ "$DB_FILE" == /usr/local/share/* ]]; then
+        cat <<EOF
+
+Error: Askey OUI database not found.
+
+Database:
+    $DB_FILE
+
+Initialize it once as administrator:
+
+    sudo /usr/local/bin/scscan -u
+
+EOF
+        exit 1
+    fi
+
+    create_default_db
+fi
+
+trap cleanup INT TERM
+
+cleanup_old
+select_interface
+show_header
+
+echo "Scanning IPv6 neighbors..."
+ping6 -c 3 -I "$INTERFACE" ff02::1 >/dev/null 2>&1
+
+ASKEY_LIST=()
+
+while read -r line; do
+    ipv6=$(echo "$line" | awk '{print $1}')
+    mac=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="lladdr") print $(i+1)}')
+    state=$(echo "$line" | awk '{print $NF}')
+
+    if is_askey "$mac"; then
+        ASKEY_LIST+=("$ipv6|$mac|$state")
+    fi
+done < <(
+    ip -6 neighbor show dev "$INTERFACE" \
+    | awk '/lladdr/ && /(REACHABLE|STALE|DELAY|PROBE|router)/ {print}'
+)
+
+if [ ${#ASKEY_LIST[@]} -eq 0 ]; then
+    echo
+    echo "No Askey device found."
+    exit 1
+fi
+
+PORT="$BASE_PORT"
+RESULTS=()
+
+for item in "${ASKEY_LIST[@]}"; do
+    PORT=$(next_port "$PORT")
+    RESULTS+=("$PORT|$item")
+    PORT=$((PORT + 1))
+done
+
+echo
+echo "Found ${#RESULTS[@]} Askey device(s)."
+echo
+
+printf "%-4s %-8s %-42s %-18s %-10s\n" \
+"No." "Port" "IPv6" "MAC" "State"
+
+printf "%-4s %-8s %-42s %-18s %-10s\n" \
+"---" "------" "----------------------------------------" "-----------------" "----------"
+
+for i in "${!RESULTS[@]}"; do
+    IFS='|' read -r port ipv6 mac state <<< "${RESULTS[$i]}"
+    printf "%-4s %-8s %-42s %-18s %-10s\n" \
+    "$((i+1))" "$port" "$ipv6" "$mac" "$state"
+done
+
+echo
+echo "Creating tunnels..."
+
+: > "$PID_FILE"
+: > "$PORT_FILE"
+
+for item in "${RESULTS[@]}"; do
+    IFS='|' read -r port ipv6 mac state <<< "$item"
+
+    ssh -N -f \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 \
+    -L "$port:[$ipv6%$INTERFACE]:$REMOTE_PORT" \
+    "$SSH_USER@$SSH_HOST"
+
+    if [ $? -eq 0 ]; then
+        pid=$(pgrep -n -f "ssh.*$port:.*$ipv6")
+        echo "$pid" >> "$PID_FILE"
+        echo "$port|$ipv6|$mac|$state" >> "$PORT_FILE"
+        echo "✓ localhost:$port -> $mac"
+    else
+        echo "✗ failed: $mac"
+    fi
+done
+
+echo
+echo "=============================================================="
+echo "Open Browser"
+echo "=============================================================="
+
+while IFS='|' read -r port ipv6 mac state; do
+    echo "$mac  https://localhost:$port"
+done < "$PORT_FILE"
+
+echo
+echo "Ctrl+C to close all tunnels."
+echo
+
+while true; do
+    sleep 1
+done
